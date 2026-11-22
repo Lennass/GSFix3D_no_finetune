@@ -1,4 +1,4 @@
 model:
   name: marigold_pipeline
-  pretrained_path: gsfixer-full
+  pretrained_path: gsfixer-pretrained-merged
   latent_scale_factor: 0.18215

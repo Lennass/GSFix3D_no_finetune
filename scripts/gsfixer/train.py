@@ -160,6 +160,51 @@ if "__main__" == __name__:
 
     cfg_data = cfg.dataset
 
+    # Resolve the global input ablation before constructing any dataset. This
+    # avoids loading/augmenting mesh images (and consuming extra RNG draws) in a
+    # GS-only run.
+    if "mixed" == cfg_data.train.name:
+        train_dual_flags = [
+            bool(dataset_cfg.get("dual_input", False))
+            for dataset_cfg in cfg_data.train.dataset_list
+        ]
+        if len(set(train_dual_flags)) != 1:
+            raise ValueError(
+                f"Mixed datasets must use a consistent dual_input setting, got {train_dual_flags}"
+            )
+        datasets_support_dual_input = all(train_dual_flags)
+    else:
+        datasets_support_dual_input = bool(cfg_data.train.get("dual_input", False))
+
+    input_cfg = getattr(cfg, "input_conditioning", None)
+    dual_input = bool(
+        getattr(input_cfg, "dual_input_enabled", datasets_support_dual_input)
+    ) if input_cfg is not None else datasets_support_dual_input
+    if dual_input and not datasets_support_dual_input:
+        raise ValueError("dual_input_enabled=true, but the training dataset has no mesh input")
+
+    for split_name in ("train", "val", "vis"):
+        split_cfg = cfg_data.get(split_name)
+        if split_cfg is None:
+            continue
+        if "mixed" == split_cfg.name:
+            for dataset_cfg in split_cfg.dataset_list:
+                dataset_cfg.dual_input = dual_input
+        else:
+            split_cfg.dual_input = dual_input
+
+    # Keep pretraining ablation controls in train_gsfixer.yaml. Dataset-specific
+    # configs only describe the datasets; the shared hole augmentation is injected
+    # before dataset construction.
+    # ===== ABLATION[A3] Inject the black-hole augmentation switch into datasets. =====
+    hole_aug_cfg = getattr(cfg, "hole_aug", None)
+    if hole_aug_cfg is not None:
+        if "mixed" == cfg_data.train.name:
+            for dataset_cfg in cfg_data.train.dataset_list:
+                dataset_cfg.hole_aug = hole_aug_cfg
+        else:
+            cfg_data.train.hole_aug = hole_aug_cfg
+
     # Other directories
     out_dir_ckpt = os.path.join(out_dir_run, "checkpoint")
     if not os.path.exists(out_dir_ckpt):
@@ -322,6 +367,12 @@ if "__main__" == __name__:
 
     trainer_cls = get_trainer_cls(cfg.trainer.name)
     logging.debug(f"Trainer: {trainer_cls}")
+
+    logging.info(
+        f"Trainer dual_input = {dual_input} "
+        f"(dataset support = {datasets_support_dual_input})"
+    )
+
     trainer = trainer_cls(
         cfg=cfg,
         model=model,
@@ -333,7 +384,7 @@ if "__main__" == __name__:
         accumulation_steps=accumulation_steps,
         val_dataloaders=[val_loader],
         vis_dataloaders=[vis_loader],
-        dual_input=cfg_data.train.get("dual_input", False),
+        dual_input=dual_input,
     )
 
     # -------------------- Checkpoint --------------------

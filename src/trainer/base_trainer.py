@@ -33,16 +33,18 @@
 
 
 from abc import abstractmethod
+import copy
 import logging
 import os
 import shutil
 import torch
+import torch.nn.functional as F
 from datetime import datetime
 from diffusers import DDPMScheduler, DDIMScheduler
 from omegaconf import OmegaConf
 from torch.nn import Conv2d
 from torch.nn.parameter import Parameter
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torchvision.transforms import GaussianBlur, Compose
@@ -95,23 +97,80 @@ class BaseTrainer:
             self.input_channels = 12  # mesh + gs
         else:
             self.input_channels = 8  # only gs
-        if self.input_channels != self.model.unet.config["in_channels"]:
+        # Track whether conv_in was rebuilt (channel expansion). When the base
+        # already has the right in_channels (e.g. finetuning gsfixer-full), conv_in
+        # is the pretrained one and must NOT be unfrozen under LoRA.
+        self.conv_in_replaced = self.input_channels != self.model.unet.config["in_channels"]
+        if self.conv_in_replaced:
             self._replace_unet_conv_in()
 
         # Encode empty text prompt
         self.model.encode_empty_text()
         self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
 
-        self.model.unet.enable_xformers_memory_efficient_attention()
+        # Attention backend. xformers' prebuilt flash-attention kernels are
+        # Hopper-only and crash on Blackwell (RTX 5090, sm_120) with a CUDA
+        # "invalid argument" from flash_fwd_launch_template.h — especially under
+        # bf16, which routes attention through that flash path. Default to
+        # PyTorch SDPA (AttnProcessor2_0), which supports Blackwell natively and
+        # is also memory-efficient. Set speedup.use_xformers: true to opt back in.
+        _speedup_cfg = getattr(self.cfg, "speedup", None)
+        _use_xformers = bool(getattr(_speedup_cfg, "use_xformers", False)) if _speedup_cfg is not None else False
+        if _use_xformers:
+            try:
+                self.model.unet.enable_xformers_memory_efficient_attention()
+                logging.info("xformers memory-efficient attention enabled")
+            except Exception as e:
+                logging.warning(f"xformers enable failed, falling back to SDPA: {e}")
+                _use_xformers = False
+        if not _use_xformers:
+            try:
+                from diffusers.models.attention_processor import AttnProcessor2_0
+                self.model.unet.set_attn_processor(AttnProcessor2_0())
+                logging.info("Using PyTorch SDPA attention (AttnProcessor2_0)")
+            except Exception as e:
+                logging.warning(f"Could not set SDPA attention processor: {e}")
 
         # Trainability
         self.model.vae.requires_grad_(False)
         self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
 
+        # ===== ABLATION[A5] Expanded-layer LoRA; false means full-UNet training. =====
+        lora_cfg = getattr(self.cfg, "lora", None)
+        self.lora_enabled = bool(getattr(lora_cfg, "enabled", False)) if lora_cfg is not None else False
+        self.lora_save_merged = bool(getattr(lora_cfg, "save_merged", True)) if lora_cfg is not None else True
+        self._lora_peft_config = None
+        self._lora_load_path = None
+        if self.lora_enabled:
+            self._setup_lora(lora_cfg)
+
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
-        self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+        trainable_params = [p for p in self.model.unet.parameters() if p.requires_grad]
+        opt_cfg = self.cfg.optimizer
+        opt_name = getattr(opt_cfg, "name", "Adam")
+        # ===== ABLATION[A7] AdamW; false restores the original Adam optimizer. =====
+        adamw_enabled = bool(getattr(opt_cfg, "adamw_enabled", opt_name == "AdamW"))
+        if adamw_enabled:
+            kwargs_cfg = getattr(opt_cfg, "adamw_kwargs", getattr(opt_cfg, "kwargs", {}))
+            _opt_cls = AdamW
+        else:
+            kwargs_cfg = getattr(opt_cfg, "adam_kwargs", {})
+            _opt_cls = Adam
+        if OmegaConf.is_config(kwargs_cfg):
+            opt_kwargs = OmegaConf.to_container(kwargs_cfg, resolve=True)
+        else:
+            opt_kwargs = dict(kwargs_cfg)
+        self.optimizer = _opt_cls(trainable_params, lr=lr, **opt_kwargs)
+        logging.info(f"Optimizer: {_opt_cls.__name__}({opt_kwargs})")
+        if self.lora_enabled:
+            n_trainable = sum(p.numel() for p in trainable_params)
+            n_total = sum(p.numel() for p in self.model.unet.parameters())
+            logging.info(
+                f"LoRA enabled: trainable params {n_trainable:,} / {n_total:,} "
+                f"({100.0 * n_trainable / max(n_total, 1):.2f}%)"
+            )
 
         # LR scheduler
         lr_func = IterExponential(
@@ -123,6 +182,18 @@ class BaseTrainer:
 
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
+        # ===== ABLATION[A4] Decoded-x0 pixel-space auxiliary loss. =====
+        self.pixel_loss_enabled = bool(getattr(self.cfg, "pixel_loss", {}).get("enabled", False))
+        self.pixel_loss_weight = float(getattr(self.cfg, "pixel_loss", {}).get("weight", 0.0))
+        self.pixel_loss_max_samples = int(getattr(self.cfg, "pixel_loss", {}).get("max_samples", 1))
+        self.pixel_loss_latent_downsample = int(getattr(self.cfg, "pixel_loss", {}).get("latent_downsample", 1))
+        self.pixel_loss_fn = None
+        if self.pixel_loss_enabled:
+            pixel_loss_cfg = self.cfg.pixel_loss
+            self.pixel_loss_fn = get_loss(
+                loss_name=pixel_loss_cfg.name,
+                **pixel_loss_cfg.kwargs,
+            )
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_config(
@@ -153,7 +224,10 @@ class BaseTrainer:
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
 
-        self.train_metrics = MetricTracker(*["loss"])
+        train_metric_keys = ["loss", "latent_loss"]
+        if self.pixel_loss_enabled:
+            train_metric_keys.append("pixel_loss")
+        self.train_metrics = MetricTracker(*train_metric_keys)
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
 
         # main metric for best checkpoint saving
@@ -195,16 +269,170 @@ class BaseTrainer:
             GaussianBlur(kernel_size=13),
         ])
 
+        # Speedup options
+        speedup_cfg = getattr(self.cfg, "speedup", None)
+        self.use_bf16 = bool(getattr(speedup_cfg, "bf16", False)) if speedup_cfg is not None else False
+        self.use_compile = bool(getattr(speedup_cfg, "torch_compile", False)) if speedup_cfg is not None else False
+        self.timestep_max = int(getattr(speedup_cfg, "timestep_max", self.scheduler_timesteps)) if speedup_cfg is not None else self.scheduler_timesteps
+        self.timestep_max = max(1, min(self.timestep_max, self.scheduler_timesteps))
+
+        if self.use_compile:
+            try:
+                self.model.unet = torch.compile(
+                    self.model.unet, mode="reduce-overhead", fullgraph=False, dynamic=True
+                )
+                logging.info("torch.compile enabled on UNet (reduce-overhead)")
+            except Exception as e:
+                self.use_compile = False
+                logging.warning(f"torch.compile failed, fallback to eager: {e}")
+
+        logging.info(
+            f"Speedup: bf16={self.use_bf16}, torch_compile={self.use_compile}, "
+            f"timestep_max={self.timestep_max}/{self.scheduler_timesteps}"
+        )
+
+    def _reattach_lora_after_merge(self):
+        """DEPRECATED. No longer used: save_checkpoint now merges on a deep copy,
+        so the live UNet keeps its LoRA wrappers and the optimizer is never reset.
+        Kept for backward compatibility with external callers."""
+        try:
+            from peft import get_peft_model
+        except ImportError:
+            return
+
+        if self._lora_peft_config is None:
+            return
+
+        new_unet = get_peft_model(self.model.unet, self._lora_peft_config)
+        self.model.unet = new_unet
+
+        # Re-mark conv_in as trainable only if it was rebuilt for channel expansion.
+        # (peft wrapping freezes the base model again; keep finetune conv_in frozen.)
+        if getattr(self, "conv_in_replaced", False):
+            for p in self.model.unet.conv_in.parameters():
+                p.requires_grad = True
+
+        # Replace optimizer param refs with the new (zero-init) LoRA params + conv_in
+        new_trainable = [p for p in self.model.unet.parameters() if p.requires_grad]
+        for group in self.optimizer.param_groups:
+            group["params"] = new_trainable
+        self.optimizer.state.clear()
+
+    def _setup_lora(self, lora_cfg):
+        try:
+            from peft import LoraConfig, get_peft_model, PeftModel
+        except ImportError as e:
+            raise ImportError(
+                "LoRA is enabled but `peft` is not installed. Please `pip install peft`."
+            ) from e
+
+        rank = int(getattr(lora_cfg, "rank", 8))
+        alpha = float(getattr(lora_cfg, "alpha", 16))
+        dropout = float(getattr(lora_cfg, "dropout", 0.0))
+        target_modules = list(getattr(
+            lora_cfg,
+            "target_modules",
+            ["to_q", "to_k", "to_v", "to_out.0"],
+        ))
+        logging.info(f"LoRA targets = {target_modules}")
+        load_path = getattr(lora_cfg, "load_path", None)
+
+        # Freeze all UNet weights first; LoRA wrappers will mark adapters trainable.
+        self.model.unet.requires_grad_(False)
+
+        if load_path:
+            logging.info(f"Loading existing LoRA adapter from: {load_path}")
+            self.model.unet = PeftModel.from_pretrained(
+                self.model.unet, load_path, is_trainable=True
+            )
+            self._lora_load_path = load_path
+            self._lora_peft_config = self.model.unet.peft_config[
+                next(iter(self.model.unet.peft_config))
+            ]
+        else:
+            peft_config = LoraConfig(
+                r=rank,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                bias="none",
+                target_modules=target_modules,
+            )
+            self.model.unet = get_peft_model(self.model.unet, peft_config)
+            self._lora_peft_config = peft_config
+
+        # conv_in stays trainable under LoRA ONLY when it was rebuilt for channel
+        # expansion (training from scratch). When finetuning a base that already has
+        # the right in_channels, conv_in is pretrained and we keep it frozen so LoRA
+        # is the only thing learning (avoids overfitting conv_in on small data).
+        if getattr(self, "conv_in_replaced", False):
+            for p in self.model.unet.conv_in.parameters():
+                p.requires_grad = True
+            logging.info("conv_in was rebuilt -> kept trainable under LoRA")
+        else:
+            logging.info("conv_in is pretrained -> frozen under LoRA")
+
+    def _get_conv_in(self):
+        """Return the actual conv_in module, unwrapping PeftModel if needed."""
+        unet = self.model.unet
+        # PeftModel exposes the wrapped UNet via get_base_model()
+        get_base = getattr(unet, "get_base_model", None)
+        if callable(get_base):
+            try:
+                unet = get_base()
+            except Exception:
+                unet = self.model.unet
+        return unet.conv_in
+
+    def _save_conv_in(self, ckpt_dir):
+        """Persist the (trained) conv_in weights separately.
+
+        Under LoRA, conv_in is fully trainable but is NOT part of the LoRA
+        adapter (not in target_modules, not registered as modules_to_save), so
+        PeftModel.save_pretrained silently drops it. We save it ourselves so the
+        trained input layer is never lost.
+        """
+        from safetensors.torch import save_file
+
+        conv_in = self._get_conv_in()
+        state = {
+            "weight": conv_in.weight.detach().cpu(),
+            "bias": conv_in.bias.detach().cpu(),
+        }
+        path = os.path.join(ckpt_dir, "conv_in.safetensors")
+        save_file(state, path)
+        logging.info(f"conv_in weights saved to: {path}")
+
+    def _load_conv_in(self, ckpt_path):
+        """Load conv_in weights saved by _save_conv_in, if present."""
+        from safetensors.torch import load_file
+
+        path = os.path.join(ckpt_path, "conv_in.safetensors")
+        if not os.path.isfile(path):
+            logging.warning(
+                f"No conv_in.safetensors found at {path}; conv_in keeps current weights."
+            )
+            return
+        state = load_file(path)
+        conv_in = self._get_conv_in()
+        with torch.no_grad():
+            conv_in.weight.copy_(state["weight"].to(conv_in.weight.device, conv_in.weight.dtype))
+            conv_in.bias.copy_(state["bias"].to(conv_in.bias.device, conv_in.bias.dtype))
+        logging.info(f"conv_in weights loaded from: {path}")
+
     def _replace_unet_conv_in(self):
+
         # replace the first layer to accept 8 or 12 in_channels
-        _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
-        _bias = self.model.unet.conv_in.bias.clone()  # [320]
+        _weight = self.model.unet.conv_in.weight.clone()
+        _bias = self.model.unet.conv_in.bias.clone()
+        # If checkpoint already has >4 channels (e.g. loaded from a prior run),
+        # extract only the first 4 (original latent channels) before rebuilding.
+        if _weight.shape[1] > 4:
+            _weight = _weight[:, :4, :, :].clone()
         if self.dual_input:
-            _weight = _weight.repeat((1, 3, 1, 1))  # Keep selected channel(s)
-            # divide the activation magnitude by a factor
+            _weight = _weight.repeat((1, 3, 1, 1))  # 4 → 12
             _weight *= 0.33
         else:
-            _weight = _weight.repeat((1, 2, 1, 1))
+            _weight = _weight.repeat((1, 2, 1, 1))  # 4 → 8
             _weight *= 0.5
 
         # new conv_in channel
@@ -279,7 +507,7 @@ class BaseTrainer:
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
-                    self.scheduler_timesteps,
+                    self.timestep_max,
                     (batch_size,),
                     device=device,
                     generator=rand_num_generator,
@@ -327,9 +555,15 @@ class BaseTrainer:
                 cat_latents = cat_latents.float()
 
                 # Predict the noise residual
-                model_pred = self.model.unet(
-                    cat_latents, timesteps, text_embed
-                ).sample  # [B, 4, h, w]
+                if self.use_bf16:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        model_pred = self.model.unet(
+                            cat_latents, timesteps, text_embed
+                        ).sample  # [B, 4, h, w]
+                else:
+                    model_pred = self.model.unet(
+                        cat_latents, timesteps, text_embed
+                    ).sample  # [B, 4, h, w]
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
 
@@ -346,10 +580,60 @@ class BaseTrainer:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
 
                 latent_loss = self.loss(model_pred.float(), target.float())
+                total_loss = latent_loss
+                pixel_loss_value = None
 
-                loss = latent_loss.mean()
+                # ===== ABLATION[A4] Add pixel loss only when this switch is on. =====
+                if self.pixel_loss_enabled:
+                    if "sample" == self.prediction_type:
+                        pred_x0_latent = model_pred
+                    elif "epsilon" == self.prediction_type:
+                        alpha_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
+                        alpha_t = alpha_cumprod[timesteps].view(-1, 1, 1, 1)
+                        sqrt_alpha_t = torch.sqrt(alpha_t)
+                        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
+                        pred_x0_latent = (noisy_latents - sqrt_one_minus_alpha_t * model_pred) / sqrt_alpha_t
+                    elif "v_prediction" == self.prediction_type:
+                        alpha_cumprod = self.training_noise_scheduler.alphas_cumprod.to(device)
+                        alpha_t = alpha_cumprod[timesteps].view(-1, 1, 1, 1)
+                        sqrt_alpha_t = torch.sqrt(alpha_t)
+                        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
+                        pred_x0_latent = sqrt_alpha_t * noisy_latents - sqrt_one_minus_alpha_t * model_pred
+                    else:
+                        raise ValueError(f"Unknown prediction type {self.prediction_type}")
+
+                    pred_latent_for_pixel = pred_x0_latent
+                    gt_rgb_for_pixel = rgb
+
+                    if self.pixel_loss_max_samples > 0 and pred_latent_for_pixel.shape[0] > self.pixel_loss_max_samples:
+                        pred_latent_for_pixel = pred_latent_for_pixel[:self.pixel_loss_max_samples]
+                        gt_rgb_for_pixel = gt_rgb_for_pixel[:self.pixel_loss_max_samples]
+
+                    if self.pixel_loss_latent_downsample > 1:
+                        pred_latent_for_pixel = F.interpolate(
+                            pred_latent_for_pixel,
+                            scale_factor=1.0 / self.pixel_loss_latent_downsample,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                    pred_rgb = self.decode_rgb(pred_latent_for_pixel)
+                    if pred_rgb.shape[-2:] != gt_rgb_for_pixel.shape[-2:]:
+                        gt_rgb_for_pixel = F.interpolate(
+                            gt_rgb_for_pixel,
+                            size=pred_rgb.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    pixel_loss_value = self.pixel_loss_fn(pred_rgb.float(), gt_rgb_for_pixel.float())
+                    total_loss = total_loss + self.pixel_loss_weight * pixel_loss_value
+
+                loss = total_loss.mean()
 
                 self.train_metrics.update("loss", loss.item())
+                self.train_metrics.update("latent_loss", latent_loss.mean().item())
+                if pixel_loss_value is not None:
+                    self.train_metrics.update("pixel_loss", pixel_loss_value.mean().item())
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
                 accumulated_step += 1
@@ -359,6 +643,22 @@ class BaseTrainer:
 
                 # Perform optimization step
                 if accumulated_step >= self.gradient_accumulation_steps:
+                    # ===== ABLATION[A8] Optional global-norm gradient clipping. =====
+                    clipping_cfg = getattr(self.cfg, "gradient_clipping", None)
+                    if clipping_cfg is not None:
+                        clipping_enabled = bool(getattr(clipping_cfg, "enabled", False))
+                        max_grad_norm = float(getattr(clipping_cfg, "max_norm", 0.0))
+                        if not clipping_enabled:
+                            max_grad_norm = 0.0
+                    else:
+                        # Backward compatibility with checkpoints/configs created
+                        # before the explicit ablation switch was introduced.
+                        max_grad_norm = float(getattr(self.cfg, "max_grad_norm", 0.0))
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for group in self.optimizer.param_groups for p in group["params"]],
+                            max_grad_norm,
+                        )
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
@@ -455,48 +755,57 @@ class BaseTrainer:
             self.visualize()
 
     def validate(self):
-        for i, val_loader in enumerate(self.val_loaders):
-            val_dataset_name = val_loader.dataset.disp_name
-            val_metric_dict = self.validate_single_dataset(
-                data_loader=val_loader, metric_tracker=self.val_metrics
-            )
-            logging.info(
-                f"Iter {self.effective_iter}. Validation metrics on `{val_dataset_name}`: {val_metric_dict}"
-            )
-            tb_logger.log_dict(
-                {f"val/{val_dataset_name}/{k}": v for k, v in val_metric_dict.items()},
-                global_step=self.effective_iter,
-            )
-            # save to file
-            eval_text = eval_dict_to_text(
-                val_metrics=val_metric_dict,
-                dataset_name=val_dataset_name,
-                sample_list_path=val_loader.dataset.disp_name,
-            )
-            _save_to = os.path.join(
-                self.out_dir_eval,
-                f"eval-{val_dataset_name}-iter{self.effective_iter:06d}.txt",
-            )
-            with open(_save_to, "w+") as f:
-                f.write(eval_text)
+        was_training = self.model.unet.training
+        self.model.unet.eval()
+        try:
+            for i, val_loader in enumerate(self.val_loaders):
+                val_dataset_name = val_loader.dataset.disp_name
+                val_metric_dict = self.validate_single_dataset(
+                    data_loader=val_loader, metric_tracker=self.val_metrics
+                )
+                logging.info(
+                    f"Iter {self.effective_iter}. Validation metrics on `{val_dataset_name}`: {val_metric_dict}"
+                )
+                tb_logger.log_dict(
+                    {f"val/{val_dataset_name}/{k}": v for k, v in val_metric_dict.items()},
+                    global_step=self.effective_iter,
+                )
+                # save to file
+                eval_text = eval_dict_to_text(
+                    val_metrics=val_metric_dict,
+                    dataset_name=val_dataset_name,
+                    sample_list_path=val_loader.dataset.disp_name,
+                )
+                _save_to = os.path.join(
+                    self.out_dir_eval,
+                    f"eval-{val_dataset_name}-iter{self.effective_iter:06d}.txt",
+                )
+                with open(_save_to, "w+") as f:
+                    f.write(eval_text)
 
-            # Update main eval metric
-            if 0 == i:
-                main_eval_metric = val_metric_dict[self.main_val_metric]
-                if (
-                    "minimize" == self.main_val_metric_goal
-                    and main_eval_metric < self.best_metric
-                    or "maximize" == self.main_val_metric_goal
-                    and main_eval_metric > self.best_metric
-                ):
-                    self.best_metric = main_eval_metric
-                    logging.info(
-                        f"Best metric: {self.main_val_metric} = {self.best_metric} at iteration {self.effective_iter}"
-                    )
-                    # Save a checkpoint
-                    self.save_checkpoint(
-                        ckpt_name=self._get_backup_ckpt_name(), save_train_state=False
-                    )
+                # Update main eval metric
+                if 0 == i:
+                    main_eval_metric = val_metric_dict[self.main_val_metric]
+                    if (
+                        "minimize" == self.main_val_metric_goal
+                        and main_eval_metric < self.best_metric
+                        or "maximize" == self.main_val_metric_goal
+                        and main_eval_metric > self.best_metric
+                    ):
+                        self.best_metric = main_eval_metric
+                        logging.info(
+                            f"Best metric: {self.main_val_metric} = {self.best_metric} at iteration {self.effective_iter}"
+                        )
+                        # Save a timestamped checkpoint and overwrite the fixed "best" slot
+                        self.save_checkpoint(
+                            ckpt_name=self._get_backup_ckpt_name(), save_train_state=False
+                        )
+                        self.save_checkpoint(
+                            ckpt_name="best", save_train_state=False
+                        )
+        finally:
+            if was_training:
+                self.model.unet.train()
 
     def visualize(self):
         for val_loader in self.vis_loaders:
@@ -600,8 +909,37 @@ class BaseTrainer:
 
         # Save UNet
         unet_path = os.path.join(ckpt_dir, "unet")
-        self.model.unet.save_pretrained(unet_path, safe_serialization=True)
-        logging.info(f"UNet is saved to: {unet_path}")
+        if self.lora_enabled:
+            # Always save LoRA adapter for resuming/continued finetune
+            lora_adapter_path = os.path.join(ckpt_dir, "lora")
+            self.model.unet.save_pretrained(lora_adapter_path, safe_serialization=True)
+            logging.info(f"LoRA adapter is saved to: {lora_adapter_path}")
+
+            # conv_in is trainable but not captured by the LoRA adapter; save it
+            # separately so the trained input layer can always be restored.
+            self._save_conv_in(ckpt_dir)
+
+            if self.lora_save_merged:
+                # Export a clean UNet with LoRA merged for inference (no peft required).
+                # Merge on a DEEP COPY so the live training model and optimizer state
+                # are never touched — merging in place would unload the LoRA wrappers
+                # and force an optimizer reset on every save, disrupting training.
+                try:
+                    unet_copy = copy.deepcopy(self.model.unet)
+                    merged_unet = unet_copy.merge_and_unload()
+                    merged_unet.save_pretrained(unet_path, safe_serialization=True)
+                    del unet_copy, merged_unet
+                    logging.info(f"Merged UNet is saved to: {unet_path}")
+                except Exception as e:
+                    logging.warning(f"LoRA merge_and_unload failed, fallback to raw save: {e}")
+                    self.model.unet.save_pretrained(unet_path, safe_serialization=True)
+            else:
+                self.model.unet.save_pretrained(unet_path, safe_serialization=True)
+                logging.info(f"UNet (with LoRA wrappers) is saved to: {unet_path}")
+        else:
+            self.model.unet.save_pretrained(unet_path, safe_serialization=True)
+            logging.info(f"UNet is saved to: {unet_path}")
+
 
         # Save scheduler
         scheduelr_path = os.path.join(ckpt_dir, "scheduler")
@@ -637,13 +975,37 @@ class BaseTrainer:
         self, ckpt_path, load_trainer_state=True, resume_lr_scheduler=True
     ):
         logging.info(f"Loading checkpoint from: {ckpt_path}")
-        # Load UNet
-        _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
-        self.model.unet.load_state_dict(
-            torch.load(_model_path, map_location=self.device)
-        )
-        self.model.unet.to(self.device)
-        logging.info(f"UNet parameters are loaded from {_model_path}")
+
+        lora_dir = os.path.join(ckpt_path, "lora")
+        if self.lora_enabled and os.path.isdir(lora_dir):
+            try:
+                from peft import PeftModel
+            except ImportError as e:
+                raise ImportError("LoRA checkpoint detected but peft not installed.") from e
+
+            # Reset to base UNet by merging current adapters off, then load saved adapter.
+            try:
+                base_unet = self.model.unet.get_base_model()
+            except Exception:
+                base_unet = self.model.unet
+            self.model.unet = PeftModel.from_pretrained(base_unet, lora_dir, is_trainable=True)
+            self.model.unet.to(self.device)
+            logging.info(f"LoRA adapter loaded from {lora_dir}")
+
+            # Restore the separately-saved conv_in (adapter does not contain it).
+            self._load_conv_in(ckpt_path)
+            # Keep conv_in trainable on resume when it was rebuilt for channel expansion.
+            if getattr(self, "conv_in_replaced", False):
+                for p in self._get_conv_in().parameters():
+                    p.requires_grad = True
+        else:
+            # Load UNet
+            _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.bin")
+            self.model.unet.load_state_dict(
+                torch.load(_model_path, map_location=self.device)
+            )
+            self.model.unet.to(self.device)
+            logging.info(f"UNet parameters are loaded from {_model_path}")
 
         # Load training states
         if load_trainer_state:

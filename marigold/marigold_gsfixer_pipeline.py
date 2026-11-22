@@ -329,6 +329,8 @@ class MarigoldGSFixerPipeline(DiffusionPipeline):
 
         # Convert to numpy
         final_pred = final_pred.squeeze().cpu()
+        if not torch.isfinite(final_pred).all():
+            raise ValueError("Validation prediction contains NaN/Inf")
 
         final_pred_img = (final_pred.numpy() * 255).astype(np.uint8)
         final_pred_img = chw2hwc(final_pred_img)

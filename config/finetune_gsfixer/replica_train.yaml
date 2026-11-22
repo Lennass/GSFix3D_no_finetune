@@ -2,8 +2,13 @@ dataset:
   train:
     name: replica
     disp_name: replica_train
-    dir: room1/finetune
+    dir: Replica\room1\finetune
     dual_input: true
+    # Single-scene finetuning: keep mask augmentation OFF. Random semantic-mask
+    # holes create fake dark blobs unrelated to real GS artifacts, and the model
+    # learns a spurious "blob-inpaint" prior -> at inference it hallucinates
+    # sticky color-hole patches. (base_dataset.py warns 0.0 is the finetune default.)
+    mask_aug_prob: 0.0
     resize_to_hw:
     - 480
     - 640

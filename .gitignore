@@ -158,3 +158,11 @@ doc/build/
 # Custom: ignore user-specific local files
 output*
 *.sbatch
+# 本地实验产物与第三方副本
+bijiao/
+GSFix3D-main/
+lorafinetune666/
+novel_views/
+*.pdf
+.claude/
+config/*.png

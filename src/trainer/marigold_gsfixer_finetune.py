@@ -8,10 +8,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from marigold.marigold_gsfixer_pipeline import MarigoldGSFixerPipeline
-from src.trainer.base_trainer import BaseTrainer
+from src.trainer.marigold_gsfixer_trainer import MarigoldGSFixerTrainer
 
 
-class MarigoldGSFixerFinetune(BaseTrainer):
+class MarigoldGSFixerFinetune(MarigoldGSFixerTrainer):
     def __init__(
         self,
         cfg: OmegaConf,
@@ -40,11 +40,24 @@ class MarigoldGSFixerFinetune(BaseTrainer):
                         )
 
     def _load_train_data(self, batch):
-        """Load training data from batch for finetuning."""
+        """Load training data from batch for finetuning.
+
+        When `corruption_aug.enabled` is set, the rendered gs/mesh inputs are
+        further degraded with the same randomized corruption pipeline used in
+        pretraining. This restores the "must recover detail" pressure that keeps
+        outputs sharp (better LPIPS); without it, finetuning on clean renders
+        with only MSE/L1 tends to regress toward blurry, mean-reverted outputs.
+        The rendered inputs are already normalized to [-1, 1], matching what
+        `_apply_random_corruption` expects.
+        """
         rgb = batch["gt_rgb_norm"].to(self.device)
         corrupted_rgb1 = batch["rendered_gs_norm"].to(self.device)
+        if self.corruption_aug_enabled:
+            corrupted_rgb1 = self._apply_random_corruption(corrupted_rgb1, "gs")
         if self.dual_input:
-            corrupted_rgb2 = batch["rendered_mesh_norm"].to(self.device)   
+            corrupted_rgb2 = batch["rendered_mesh_norm"].to(self.device)
+            if self.corruption_aug_enabled:
+                corrupted_rgb2 = self._apply_random_corruption(corrupted_rgb2, "mesh")
         else:
             corrupted_rgb2 = None
 

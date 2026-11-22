@@ -1,0 +1,224 @@
+1. 参数高效训练：LoRA
+
+  配置位置：config/train_gsfixer.yaml:101
+
+  当前预训练配置：
+
+  lora:
+    enabled: true
+    rank: 128
+    alpha: 128
+    dropout: 0.05
+
+  不是只对 attention 做 LoRA，而是覆盖了：
+
+  - Attention: to_q, to_k, to_v, to_out.0
+  - Transformer projection: proj_in, proj_out
+  - FFN: ff.net.0.proj, ff.net.2
+  - ResNet spatial layers: conv1, conv2, conv_shortcut
+  - 时间条件层: time_emb_proj
+
+  也就是说，这是一个偏完整的 UNet LoRA，除了 attention，还给了卷积、FFN
+  和时间嵌入一定的适应能力，更适合学习黑洞修复和空间细节生成。
+
+  实现上：
+
+  - VAE 和 text encoder 冻结；
+  - UNet 原始参数冻结；
+  - LoRA 参数训练；
+  - 因为输入通道从 4 扩展到 12，新的 conv_in 也保持可训练；
+  - conv_in 不属于 LoRA adapter，所以额外保存成 conv_in.safetensors。
+
+  相关实现见：
+
+  - src/trainer/base_trainer.py:134-160
+  - src/trainer/base_trainer.py:308-354
+  - src/trainer/base_trainer.py:368-385
+
+  2. 随机输入退化：corruption_aug
+
+  配置位置：config/train_gsfixer.yaml:43
+
+  当前是开启状态：
+
+  corruption_aug:
+    enabled: true
+
+  它替换了原来固定的：
+
+  GaussianBlur(kernel=13) + Gaussian noise(std=0.2)
+
+  现在每个训练样本会随机组合多种退化：
+
+  ┌───────────────────────┬─────────────────────────────────────────────────────┐
+  │       退化类型        │                      当前设置                       │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ Gaussian blur         │ kernel 从 [3,5,7,9,11,13] 随机选择，sigma [0.1,2.0] │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ Gaussian noise        │ std [0.0,0.3]                                       │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ JPEG 压缩             │ 概率 0.15，质量 [30,90]                             │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ Downsample + upsample │ 概率 0.25，缩放 [0.5,0.9]                           │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ Salt-and-pepper noise │ 概率 0.2                                            │
+  ├───────────────────────┼─────────────────────────────────────────────────────┤
+  │ Color jitter          │ 概率 0.3，包含亮度、对比度、饱和度变化              │
+  └───────────────────────┴─────────────────────────────────────────────────────┘
+
+  GS 输入和 mesh 输入分别独立采样退化参数，所以不会每次都受到完全相同的 corruption。
+
+  实现见：
+
+  - src/trainer/marigold_gsfixer_trainer.py:52-139
+  - src/trainer/marigold_gsfixer_trainer.py:141-158
+
+  这部分的核心作用是让模型不只学习一种固定模糊，而是学习从多种渲染质量问题中恢复真实 RGB 细节。
+
+  3. 更接近真实 3DGS 黑洞的 Hole Augmentation
+
+  这部分也是新增的，而且当前实际上已经打开了：
+
+  配置位置：config/train_gsfixer/dataset_train.yaml:19-24
+
+  hole_aug:
+    enabled: true
+    prob: 0.5
+    max_holes: 3
+    size_frac: [0.05, 0.30]
+    darkness: 0.0
+    feather: 0.4
+
+  具体做法：
+
+  - 随机生成 1 到 3 个洞；
+  - 用多个重叠椭圆组成不规则形状；
+  - 洞大小约为图像短边的 5% 到 30%；
+  - 洞内部压到黑色；
+  - 边缘做 Gaussian feather，避免形成特别生硬的人工圆形；
+  - GS 和 mesh 两路分别独立打洞；
+  - 只作用在预训练的 BaseTrainDataset。
+
+  实现见：
+
+  - src/dataset/base_dataset.py:178-228
+  - src/dataset/base_dataset.py:272-278
+
+  需要特别注意：配置里的注释多次写着 "Currently OFF"，但真正的配置值是：
+
+  enabled: true
+
+  所以现在是开启的，不是关闭的。
+
+  原本已有的 PIPE semantic-mask augmentation 也仍然保留，训练时大约以 0.3 概率产生语义 mask 类型的缺失区域。新的
+  hole_aug 是在它基础上增加的、更像 3DGS 黑洞的退化。
+
+  4. Latent loss + Pixel-space loss
+
+  配置位置：config/train_gsfixer.yaml:89-99
+
+  当前总损失是：
+
+  total_loss = latent MSE + 0.05 * pixel-space L1
+
+  实现流程：
+
+  1. UNet 预测噪声；
+  2. 根据 prediction type 还原预测的 x0 latent；
+  3. 用 VAE decoder 解码成 RGB；
+  4. 对预测 RGB 和 GT RGB 计算 L1；
+  5. 和原来的 latent diffusion loss 相加。
+
+  当前设置：
+
+  pixel_loss:
+    enabled: true
+    weight: 0.05
+    max_samples: 1
+    latent_downsample: 2
+
+  这样做是为了弥补纯 latent MSE 对高频细节约束不足的问题，直接在 RGB 空间给模型一点清晰度和纹理监督。
+
+  实现见：
+
+  - src/trainer/base_trainer.py:171-183
+  - src/trainer/base_trainer.py:564-610
+
+  由于 VAE decode 比较耗显存，所以每个 batch 只取一个样本，并且先把 latent 下采样 2 倍。
+
+  5. 双条件输入：mesh + GS
+
+  这是当前模型的基本输入结构，不是这次新加的主要创新，但现在仍然生效。
+
+  预训练默认是：
+
+  dual_input: true
+
+  输入通道由 SD2 原来的 4 通道扩展成 12 通道：
+
+  [mesh latent 4, gs latent 4, noisy target latent 4]
+
+  对应：
+
+  cat_latents = torch.cat(
+      [corrupted_rgb2_latent, corrupted_rgb1_latent, noisy_latents],
+      dim=1
+  )
+
+  位置：
+
+  - src/trainer/base_trainer.py:528-537
+  - marigold/marigold_gsfixer_pipeline.py:467-475
+
+  因此模型同时利用 mesh 的结构信息和 GS 的外观信息。
+
+  6. Multi-resolution noise
+
+  当前配置仍然开启：
+
+  multi_res_noise:
+    strength: 0.9
+    annealed: true
+    downscale_strategy: original
+
+  它会在普通 Gaussian noise 之外加入多个空间尺度的噪声，并随 timestep 调整强度。这个更偏向已有的 Marigold/GSFix3D
+  训练机制，不是这次新增的主要内容，但它对大结构和低频区域修复有帮助。
+
+  实现见：
+
+  - src/trainer/base_trainer.py:489-516
+  - src/util/multi_res_noise.py:37-103
+
+  7. 训练稳定性和显存优化
+
+  这些属于工程优化，不太适合称为模型创新：
+
+  - AdamW + weight decay 0.01；
+  - gradient clipping，最大范数 1.0；
+  - 预训练使用 bf16；
+  - 默认使用 PyTorch SDPA，避免部分 GPU 上 xFormers kernel 不兼容；
+  - checkpoint 同时保存 LoRA adapter 和独立的 conv_in；
+  - 保存 checkpoint 时在 deep copy 上 merge LoRA，不破坏正在训练的 UNet 和 optimizer。
+
+  总结
+
+  如果只总结为论文或汇报里的几条核心创新，我会写成：
+
+  1. Parameter-efficient diffusion adaptation
+     使用覆盖 attention、FFN、ResNet convolution 和 temporal projection 的 full-network LoRA，并联合训练扩展后的输入层。
+  2. Multi-corruption degradation augmentation
+     用随机 blur、noise、JPEG、downsampling、salt-and-pepper 和 color jitter 替代固定退化，增强对不同渲染质量的泛化。
+  3. 3DGS artifact-aware hole augmentation
+     构造带有大面积、黑色、不规则、软边缘的合成空洞，使模型学习真实 3DGS 黑洞的 zero-shot inpainting。
+  4. Latent-to-pixel hybrid supervision
+     将 latent diffusion loss 和从预测 x0 解码得到的 pixel-space L1 loss 结合，改善高频细节和清晰度。
+  5. Dual-condition mesh/GS diffusion repair
+     通过 mesh + Gaussian Splatting 双条件输入进行场景结构和外观联合修复。
+
+  另外，config/rtx4060_8gb_all_optimizations.yaml 里的
+  progressive_resolution、curriculum_learning、AdaLoRA、adaptive_diffusion
+  等目前不能算已经实现的预训练创新：它们主要是配置里的实验开关，代码中没有对应训练逻辑，且 AdaLoRA 当前还是 enabled:
+  false。
+
+  还有一个配置上的不一致：预训练 LoRA 是 rank: 128, alpha: 128，而 finetune 配置是 rank: 32, alpha: 64 且只作用于
+  attention；所以 finetune 配置中“与预训练 adapter 一致”的注释目前并不准确。

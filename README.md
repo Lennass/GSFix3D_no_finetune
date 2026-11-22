@@ -20,6 +20,7 @@ Abstract: *Recent developments in 3D Gaussian Splatting have significantly enhan
 - **[2025-11-18]**: Released the code and data of GSFix3D. More models are coming soon, stay tuned!
 - **[2025-11-06]**: Our paper has been accepted by International Conference on 3D Vision 2026 (3DV)!
 - **[2025-08-20]**: Released the paper on arXiv.
+- 
 
 ## Setup
 

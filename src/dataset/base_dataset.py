@@ -51,6 +51,10 @@ class DatasetMode(Enum):
     VIS = "vis"
 
 
+def default_rgb_transform(x):
+    return x / 255.0 * 2 - 1
+
+
 class BaseDataset(Dataset):
     """
     Base dataset providing shared utilities and common fields used by subclasses.
@@ -77,7 +81,7 @@ class BaseDataset(Dataset):
         disp_name: str,
         dual_input: bool = False,
         resize_to_hw=None,
-        rgb_transform=lambda x: x / 255.0 * 2 - 1,
+        rgb_transform=default_rgb_transform,
         filename_ls_path: str = None,
         **kwargs,
     ) -> None:
@@ -152,14 +156,15 @@ class BaseTrainDataset(BaseDataset):
         disp_name: str,
         dual_input: bool = False,
         resize_to_hw=None,
-        rgb_transform=lambda x: x / 255.0 * 2 - 1,  #  [0, 255] -> [-1, 1],
+        rgb_transform=default_rgb_transform,  #  [0, 255] -> [-1, 1],
         filename_ls_path: str = None,
+        hole_aug: dict = None,
         **kwargs,
     ) -> None:
-        
+
         if filename_ls_path is None:
             raise ValueError("filename_ls_path must be provided for BaseTrainDataset.")
-    
+
         super().__init__(
             mode=mode,
             filename_ls_path=filename_ls_path,
@@ -170,8 +175,58 @@ class BaseTrainDataset(BaseDataset):
             rgb_transform=rgb_transform,
         )
 
+        # Stronger, GS-artifact-like hole augmentation for pretraining. When
+        # disabled (default), the legacy PIPE semantic-mask holes are used. When
+        # enabled, we additionally punch large, dark, irregular holes into the
+        # rendered gs/mesh inputs so the model learns to inpaint real GS black
+        # holes zero-shot. Only affects pretraining (BaseTrainDataset); finetune
+        # keeps mask aug off (see BaseFinetuneDataset).
+        # ===== ABLATION[A3] Read the GS black-hole augmentation switch. =====
+        hole_aug = hole_aug or {}
+        self.hole_aug_enabled = bool(hole_aug.get("enabled", False))
+        self.hole_aug_prob = float(hole_aug.get("prob", 0.5))
+        self.hole_aug_max_holes = int(hole_aug.get("max_holes", 3))
+        self.hole_aug_size_frac = list(hole_aug.get("size_frac", [0.05, 0.30]))
+        self.hole_aug_darkness = float(hole_aug.get("darkness", 0.0))
+        self.hole_aug_feather = float(hole_aug.get("feather", 0.4))
+
     def __len__(self):
         return len(self.filenames)
+
+    def _punch_gs_holes(self, image: np.ndarray) -> np.ndarray:
+        """Punch large, dark, irregular holes into an HxWxC uint8 image to mimic
+        real 3DGS black holes / missing geometry. Returns a new array.
+
+        Holes are built from a few overlapping ellipses at random positions, then
+        blurred at the edges (feather) so the border is soft rather than a clean
+        cut — closer to how GS artifacts fade out. `darkness` is the value the
+        hole is pushed toward (0 = black).
+        """
+        h, w = image.shape[:2]
+        n_holes = random.randint(1, max(1, self.hole_aug_max_holes))
+        mask = np.zeros((h, w), dtype=np.float32)
+        min_frac, max_frac = self.hole_aug_size_frac
+        for _ in range(n_holes):
+            frac = random.uniform(min_frac, max_frac)
+            radius = max(4, int(frac * min(h, w)))
+            cx = random.randint(0, w - 1)
+            cy = random.randint(0, h - 1)
+            # Irregular: a couple of overlapping ellipses with random axes/angle.
+            for _ in range(random.randint(1, 3)):
+                ax = max(3, int(radius * random.uniform(0.5, 1.2)))
+                ay = max(3, int(radius * random.uniform(0.5, 1.2)))
+                angle = random.uniform(0, 360)
+                ox = cx + random.randint(-radius // 2, radius // 2)
+                oy = cy + random.randint(-radius // 2, radius // 2)
+                cv2.ellipse(mask, (ox, oy), (ax, ay), angle, 0, 360, 1.0, -1)
+        # Feather the edges.
+        if self.hole_aug_feather > 0:
+            k = max(3, int(self.hole_aug_feather * radius) | 1)  # odd kernel
+            mask = cv2.GaussianBlur(mask, (k, k), 0)
+        mask = np.clip(mask, 0.0, 1.0)[..., np.newaxis]  # HxWx1
+        target = np.full_like(image, int(self.hole_aug_darkness * 255), dtype=np.float32)
+        out = image.astype(np.float32) * (1.0 - mask) + target * mask
+        return out.astype(image.dtype)
 
     def __getitem__(self, index):
         rasters, other = self._get_data_item(index)
@@ -215,6 +270,15 @@ class BaseTrainDataset(BaseDataset):
             _, blurred_mask = self._sample_mask(split, rgb.shape[1], rgb.shape[0])
             gs_image = gs_image * (1 - blurred_mask)
 
+        # Stronger GS-artifact-like holes (large / dark / irregular). Applied
+        # independently per input stream so gs and mesh get different holes.
+        # ===== ABLATION[A3] Apply irregular black holes only when enabled. =====
+        if self.hole_aug_enabled and DatasetMode.TRAIN == self.mode:
+            if random.random() < self.hole_aug_prob:
+                gs_image = self._punch_gs_holes(np.asarray(gs_image).astype(np.uint8))
+            if self.dual_input and random.random() < self.hole_aug_prob:
+                mesh_image = self._punch_gs_holes(np.asarray(mesh_image).astype(np.uint8))
+
         rgb, rgb_norm = self._prepare_image(rgb)
         gs_image, gs_norm = self._prepare_image(gs_image)
         outputs = {
@@ -240,7 +304,10 @@ class BaseFinetuneDataset(BaseDataset):
         disp_name: str,
         dual_input: bool = False,
         resize_to_hw=None,
-        rgb_transform=lambda x: x / 255.0 * 2 - 1,  #  [0, 255] -> [-1, 1],
+        rgb_transform=default_rgb_transform,  #  [0, 255] -> [-1, 1],
+        subset_method: str = "random",
+        subset_seed: int = 2025,
+        mask_aug_prob: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -251,6 +318,12 @@ class BaseFinetuneDataset(BaseDataset):
             resize_to_hw=resize_to_hw,
             rgb_transform=rgb_transform,
         )
+
+        # Probability of injecting a random semantic mask "hole" into the rendered
+        # GS/mesh inputs. Useful as regularization when pretraining on large data,
+        # but on single-scene finetuning it creates fake holes unrelated to the real
+        # GS black holes and pollutes inpainting -> default off (0.0) for finetune.
+        self.mask_aug_prob = float(mask_aug_prob)
 
         # Load dataset file paths for finetuning
         def _list_images_in_dir(d):
@@ -272,19 +345,42 @@ class BaseFinetuneDataset(BaseDataset):
             assert len(self.gt_rgb_path) == len(self.rendered_mesh_path), "The number of images doesn't match!"
         
         n_samples = len(self.gt_rgb_path)
-        if self.mode == DatasetMode.VIS:
-            vis_num = int(0.01 * n_samples)
-            self.gt_rgb_path = self.gt_rgb_path[:vis_num]
-            self.rendered_gs_path = self.rendered_gs_path[:vis_num]
-            if self.dual_input:
-                self.rendered_mesh_path = self.rendered_mesh_path[:vis_num]
-            
+        self.subset_method = subset_method
+        self.subset_seed = subset_seed
+
+        # Split the scene's frames into a held-out eval/vis subset and a training
+        # subset that EXCLUDES it. Previously TRAIN used every frame while EVAL/VIS
+        # randomly sampled from the same full set, so the eval frames were always a
+        # subset of the training frames (data leakage). For per-scene finetuning we
+        # must measure novel-view (held-out) quality, so train and eval are now
+        # disjoint. The eval subset is the same regardless of mode (fixed by
+        # subset_seed); TRAIN takes the complement.
+        eval_ratio = 0.1
+        eval_num = max(1, int(eval_ratio * n_samples))
+        if self.subset_method == "head":
+            eval_indices = set(range(eval_num))
+        elif self.subset_method == "random":
+            subset_rng = random.Random(self.subset_seed)
+            eval_indices = set(subset_rng.sample(range(n_samples), eval_num))
+        else:
+            raise ValueError(f"Unknown subset_method: {self.subset_method}")
+
+        if self.mode == DatasetMode.TRAIN:
+            keep_indices = [i for i in range(n_samples) if i not in eval_indices]
         elif self.mode == DatasetMode.EVAL:
-            eval_num = int(0.1 * n_samples)
-            self.gt_rgb_path = self.gt_rgb_path[:eval_num]
-            self.rendered_gs_path = self.rendered_gs_path[:eval_num]
-            if self.dual_input:
-                self.rendered_mesh_path = self.rendered_mesh_path[:eval_num]
+            keep_indices = sorted(eval_indices)
+        elif self.mode == DatasetMode.VIS:
+            # VIS is a small preview drawn from the held-out eval frames (never
+            # from training frames), so visualizations reflect novel views too.
+            vis_num = max(1, int(0.1 * len(eval_indices)))
+            keep_indices = sorted(eval_indices)[:vis_num]
+        else:
+            keep_indices = list(range(n_samples))
+
+        self.gt_rgb_path = [self.gt_rgb_path[i] for i in keep_indices]
+        self.rendered_gs_path = [self.rendered_gs_path[i] for i in keep_indices]
+        if self.dual_input:
+            self.rendered_mesh_path = [self.rendered_mesh_path[i] for i in keep_indices]
 
         self.n_samples = len(self.gt_rgb_path)
 
@@ -303,14 +399,14 @@ class BaseFinetuneDataset(BaseDataset):
             rendered_mesh = self._read_image(rendered_mesh_file)
         
         # Random semantic mask augmentation
-        if random.random() < 0.3:
+        if random.random() < self.mask_aug_prob:
             mask, blurred_mask = self._sample_mask("test", gt_rgb.shape[1], gt_rgb.shape[0])
             rendered_gs = rendered_gs * (1 - blurred_mask)
             if self.dual_input:
                 rendered_mesh = rendered_mesh * (1 - mask)
 
         # Further random mask for gs_image
-        if random.random() < 0.3:
+        if random.random() < self.mask_aug_prob:
             _, blurred_mask = self._sample_mask("test", gt_rgb.shape[1], gt_rgb.shape[0])
             rendered_gs = rendered_gs * (1 - blurred_mask)
 

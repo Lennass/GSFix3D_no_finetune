@@ -13,42 +13,144 @@ pipeline:
     default_processing_resolution: 768
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
+  num_workers: 8
+  effective_batch_size: 64
+  max_train_batch_size: 4
   seed: 2025  # to ensure continuity when resuming from checkpoint
 
 trainer:
   name: MarigoldGSFixerTrainer
   init_seed: 2025  # use null to train w/o seeding
-  save_period: 500
+  save_period: 2000
   backup_period: 2000
-  validation_period: 500
-  visualization_period: 1000
+  validation_period: 5000
+  visualization_period: 5000
+
+# Ablation switches for the pretraining innovations. Each switch is independent.
+input_conditioning:
+  dual_input_enabled: true  # false: GS-only 8-channel input; true: mesh+GS 12-channel input
+
+# ===== ABLATION[A3] GS BLACK-HOLE AUGMENTATION SWITCH =====
+hole_aug:
+  enabled: true             # false: keep only the original PIPE semantic-mask augmentation
+  prob: 0.5
+  max_holes: 3
+  size_frac: [0.05, 0.30]
+  darkness: 0.0
+  feather: 0.4
+
+# Speedup / memory options. bf16 halves activation memory and runs faster on the
+# 5090 tensor cores — needed here because full-network LoRA (attn+conv+ffn) keeps
+# activations for the whole UNet, which overflowed 31GB VRAM into shared system
+# memory (10-50x slowdown). timestep_max caps the sampled diffusion timestep.
+speedup:
+  bf16: true
+  torch_compile: false
+  timestep_max: 1000
 
 multi_res_noise:
   strength: 0.9
   annealed: true
   downscale_strategy: original
 
+# Randomized input corruption for pretraining. This replaces the old fixed
+# GaussianBlur(kernel=13) + Gaussian noise std=0.2 path when enabled.
+# Each input stream (gs / mesh) samples its own parameters independently.
+# ===== ABLATION[A2] RANDOM COMPOSITE CORRUPTION SWITCH =====
+corruption_aug:
+  enabled: true
+  blur:
+    enabled: true
+    kernel_choices: [3, 5, 7, 9, 11, 13]
+    sigma: [0.1, 2.0]
+  gaussian_noise:
+    enabled: true
+    std: [0.0, 0.3]
+  jpeg:
+    enabled: true
+    prob: 0.15
+    quality: [30, 90]
+  downsample:
+    enabled: true
+    prob: 0.25
+    scale: [0.5, 0.9]
+  salt_pepper:
+    enabled: true
+    prob: 0.2
+    amount: [0.0005, 0.01]
+  color_jitter:
+    enabled: true
+    prob: 0.3
+    brightness: [0.9, 1.1]
+    contrast: [0.9, 1.1]
+    saturation: [0.9, 1.1]
+
 max_epoch: 10000  # a large enough number
 max_iter: 30000  # usually converges at around 20k
 
 optimizer:
-  name: Adam
+  # ===== ABLATION[A7] ADAMW TRAINING-STRATEGY SWITCH =====
+  adamw_enabled: true  # false: use the original Adam optimizer
+  adamw_kwargs:
+    weight_decay: 0.01
+  adam_kwargs: {}
+
+# ===== ABLATION[A8] GRADIENT-CLIPPING STRATEGY SWITCH =====
+gradient_clipping:
+  enabled: true
+  max_norm: 1.0
 
 loss:
   name: mse_loss
   kwargs:
     reduction: mean
 
-lr: 3.0e-05
+# Auxiliary pixel-space loss decoded from predicted x0 latent. This complements
+# latent MSE and helps preserve high-frequency image details. Keep max_samples
+# low because it runs the VAE decoder during training.
+# ===== ABLATION[A4] PIXEL-SPACE AUXILIARY LOSS SWITCH =====
+pixel_loss:
+  enabled: true
+  name: l1_loss
+  kwargs:
+    reduction: mean
+  weight: 0.05
+  max_samples: 1
+  latent_downsample: 2
+
+# ===== ABLATION[A5] EXPANDED-LAYER LORA PRETRAINING SWITCH =====
+lora:
+  enabled: true
+  rank: 128
+  alpha: 128
+  dropout: 0.05
+  # Expanded beyond attention-only. Inpainting/hole-filling needs spatial
+  # synthesis capacity that lives in the ResNet convs and FFN, not just the
+  # attention projections. conv_in is handled separately (channel expansion) and
+  # must NOT be listed here.
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - proj_in
+    - proj_out
+    - ff.net.0.proj
+    - ff.net.2
+    - conv1
+    - conv2
+    - conv_shortcut
+    - time_emb_proj
+  save_merged: false
+  load_path: null
+
+lr: 1.0e-04
 lr_scheduler:
   name: IterExponential
   kwargs:
-    total_iter: 25000
-    final_ratio: 0.01
-    warmup_steps: 100
+    total_iter: 30000
+    final_ratio: 0.1
+    warmup_steps: 500
 
 # Light setting for the in-training validation and visualization
 validation:

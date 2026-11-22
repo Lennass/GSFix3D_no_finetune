@@ -1,0 +1,184 @@
+
+● 当前代码的冻结/训练关系如下。
+
+  预训练阶段
+
+  对应 config/train_gsfixer.yaml。
+
+  冻结部分
+
+  1. VAE 全部冻结
+
+  self.model.vae.requires_grad_(False)
+
+  VAE 只负责把 RGB 编码到 latent，以及把预测 latent 解码回 RGB，不更新 VAE 参数。
+
+  2. Text encoder 全部冻结
+
+  self.model.text_encoder.requires_grad_(False)
+
+  使用固定的 empty-text embedding，不训练文本条件分支。
+
+  3. UNet 原始参数全部冻结
+
+  在 LoRA 初始化时：
+
+  self.model.unet.requires_grad_(False)
+
+  所以原始的 UNet 权重不会更新，包括：
+
+  - 原始 attention 的 q/k/v/out 权重；
+  - 原始 FFN 权重；
+  - 原始 ResNet convolution 权重；
+  - 原始 time embedding 权重；
+  - UNet 中其他没有挂 LoRA 的层；
+  - 所有 bias，因为配置是：
+
+  bias="none"
+
+  训练部分
+
+  1. LoRA 参数
+
+  预训练配置中目标模块是：
+
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - proj_in
+    - proj_out
+    - ff.net.0.proj
+    - ff.net.2
+    - conv1
+    - conv2
+    - conv_shortcut
+    - time_emb_proj
+
+  这些层的关系是：
+
+  原始权重 W       冻结
+  LoRA A/B 矩阵    训练
+  实际输出         W(x) + LoRA_B(LoRA_A(x))
+
+  也就是说，虽然 LoRA 挂在 attention、FFN、卷积和时间嵌入层上，但训练的不是这些层的原始权重，而是每个 LoRA adapter
+  的低秩矩阵。
+
+  预训练配置：
+
+  rank: 128
+  alpha: 128
+  dropout: 0.05
+
+  2. 扩展后的 conv_in
+
+  双输入时，SD2 原本的 4 通道输入会扩展为 12 通道：
+
+  mesh latent:      4 channels
+  GS latent:        4 channels
+  noisy target:     4 channels
+  总计:            12 channels
+
+  原始 conv_in 会被替换：
+
+  self._replace_unet_conv_in()
+
+  它先把原来的 4 通道权重复制到 12 通道，再乘以约 0.33 进行幅度缩放。
+
+  由于这个 conv_in 是新建的，不属于原始 SD2 的 pretrained weight，所以在预训练时会被设为可训练：
+
+  if self.conv_in_replaced:
+      for p in self.model.unet.conv_in.parameters():
+          p.requires_grad = True
+
+  因此预训练阶段实际训练的是：
+
+  LoRA 参数 + 新的 12-channel conv_in
+
+  而不是整个 UNet。
+
+  预训练阶段的参数关系
+
+  VAE                         冻结
+  Text encoder                冻结
+  UNet 原始权重               冻结
+  UNet 目标层的 LoRA A/B      训练
+  扩展后的 conv_in            训练
+  scheduler                   无可训练参数
+
+  代码位置：
+
+  - src/trainer/base_trainer.py:134-160
+  - src/trainer/base_trainer.py:322-354
+
+  Finetune 阶段的区别
+
+  Finetune 的配置是：
+
+  lora:
+    enabled: true
+    rank: 32
+    alpha: 64
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+
+  因此 finetune 时训练的主要是：
+
+  attention LoRA 参数
+
+  而且通常加载的 GSFixer 模型已经是 12-channel UNet：
+
+  model.unet.config["in_channels"] == 12
+
+  此时：
+
+  self.conv_in_replaced = False
+
+  所以 finetune 中的 pretrained conv_in 也会被冻结：
+
+  VAE                         冻结
+  Text encoder                冻结
+  整个 pretrained UNet        冻结
+  pretrained conv_in          冻结
+  attention LoRA A/B          训练
+
+  这相当于只用 attention LoRA 适配单场景，减少小数据过拟合。
+
+  如果 finetune 时加载的是 4-channel SD2，而不是已经扩展好的 12-channel GSFixer 模型，那么 conv_in
+  会重新创建，此时它也会被训练。不过正常流程中应该使用已经扩展成 12 通道的 GSFixer checkpoint。
+
+  Pixel loss 会不会训练 VAE？
+
+  不会。
+
+  Pixel loss 的路径是：
+
+  UNet LoRA / conv_in
+          ↓
+  预测 x0 latent
+          ↓
+  VAE decoder
+          ↓
+  RGB L1 loss
+
+  VAE 参数被冻结，但梯度仍然可以穿过 VAE decoder 回传到预测 latent，再更新：
+
+  LoRA 参数
+  conv_in 参数
+
+  所以 pixel loss 的作用是给 UNet 增加 RGB 空间的细节监督，不是微调 VAE。
+
+  最终一句话
+
+  预训练时：
+
+  ▎ 冻结 SD2 的 VAE、text encoder 和原始 UNet 权重，只训练 UNet 指定层上的 LoRA 参数，以及为 mesh + GS 双条件新建的
+  ▎ 12-channel conv_in。
+
+  Finetune 时：
+
+  ▎ 通常冻结整个已经训练好的 GSFixer UNet 和 conv_in，只训练 attention LoRA。

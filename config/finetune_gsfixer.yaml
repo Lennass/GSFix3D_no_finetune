@@ -13,17 +13,17 @@ pipeline:
     default_processing_resolution: 768
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
-  seed: 2025  # to ensure continuity when resuming from checkpoint
+  num_workers: 4
+  effective_batch_size: 16
+  max_train_batch_size: 8
+  seed: 2025  # to ensure continuity when resuming from checkpoint  num_workers2
 
 trainer:
   name: MarigoldGSFixerFinetune
   init_seed: 2025  # use null to train w/o seeding
-  save_period: 400
-  backup_period: 1000
-  validation_period: 400
+  save_period: 50
+  backup_period: 50
+  validation_period: 100
   visualization_period: 100
 
 multi_res_noise:
@@ -31,28 +31,93 @@ multi_res_noise:
   annealed: true
   downscale_strategy: original
 
+# Randomized input corruption for finetuning. Off by default (keeps the old
+# behavior of training on clean renders). When enabled, the rendered gs/mesh
+# inputs get extra random degradation, restoring the "must recover detail"
+# pressure that keeps outputs sharp (better LPIPS). Strengths are deliberately
+# MILDER than pretraining (config/train_gsfixer.yaml) because the renders are
+# already degraded — stacking full-strength corruption on top overshoots.
+corruption_aug:
+  enabled: true
+  blur:
+    enabled: true
+    kernel_choices: [3, 5, 7]
+    sigma: [0.1, 1.0]
+  gaussian_noise:
+    enabled: true
+    std: [0.0, 0.15]
+  jpeg:
+    enabled: true
+    prob: 0.1
+    quality: [50, 95]
+  downsample:
+    enabled: true
+    prob: 0.15
+    scale: [0.7, 0.95]
+  salt_pepper:
+    enabled: true
+    prob: 0.1
+    amount: [0.0005, 0.005]
+  color_jitter:
+    enabled: true
+    prob: 0.2
+    brightness: [0.95, 1.05]
+    contrast: [0.95, 1.05]
+    saturation: [0.95, 1.05]
+
 max_epoch: 10000  # a large enough number
 max_iter: 800
 
 optimizer:
-  name: Adam
+  name: AdamW
+  kwargs:
+    weight_decay: 0.01
+
+max_grad_norm: 1.0
+
+lora:
+  enabled: true
+  rank: 32              # 与预训练 adapter 一致（load_path 非空时实际以 adapter_config.json 为准）
+  alpha: 64             # 与预训练 adapter 一致
+  dropout: 0.05
+  target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+  save_merged: false    # 只存 LoRA adapter + conv_in，保存零干扰零额外显存；推理前用 export_lora.py 合并
+  load_path: null
 
 loss:
   name: mse_loss
   kwargs:
     reduction: mean
 
-lr: 3.0e-05
+pixel_loss:
+  enabled: true
+  name: l1_loss
+  kwargs:
+    reduction: mean
+  weight: 0.01
+  max_samples: 1
+  latent_downsample: 4
+
+speedup:
+  bf16: false
+  torch_compile: false
+  timestep_max: 1000   # 覆盖全噪声区间，与4步推理的高噪声起始步对齐，改善黑洞大结构补全
+
+lr: 2e-05
 lr_scheduler:
   name: IterExponential
   kwargs:
-    total_iter: 25000
-    final_ratio: 0.01
+    total_iter: 800
+    final_ratio: 0.02
     warmup_steps: 100
 
 # Light setting for the in-training validation and visualization
 validation:
-  denoising_steps: 1
+  denoising_steps: 4   # match inference (pipeline default 4); 1-step val糊，选出的best会偏
   ensemble_size: 1
   processing_res: 0
   match_input_res: false
