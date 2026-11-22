@@ -1,3 +1,6 @@
+> **本仓库是基于 [GSFix3D](https://github.com/GSFix3D/GSFix3D) 的消融实验分支（no-finetune 设置）。**&#8203;
+> 原始代码与论文版权归原作者所有，许可证见 `LICENSES/`。
+
 <h1 align="center"> GSFix3D: Diffusion-Guided Repair of Novel Views in Gaussian Splatting </h1>
 
 <h3 align="center"> Jiaxin Wei, Stefan Leutenegger, Simon Schaefer </h3>
